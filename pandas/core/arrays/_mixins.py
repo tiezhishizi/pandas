@@ -33,6 +33,7 @@ class NDArrayBackedExtensionArray(ExtensionArray):
     def take(
         self: _T,
         indices: Sequence[int],
+        *,
         allow_fill: bool = False,
         fill_value: Any = None,
     ) -> _T:

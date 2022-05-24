@@ -646,10 +646,10 @@ class DataFrame(NDFrame):
         """
         Can we transpose this DataFrame without creating any new array objects.
         """
-        if self._data.any_extension_types:
+        if self._mgr.any_extension_types:
             # TODO(EA2D) special case would be unnecessary with 2D EAs
             return False
-        return len(self._data.blocks) == 1
+        return len(self._mgr.blocks) == 1
 
     # ----------------------------------------------------------------------
     # Rendering Methods
@@ -2856,7 +2856,7 @@ class DataFrame(NDFrame):
         Get the values of the i'th column (ndarray or ExtensionArray, as stored
         in the Block)
         """
-        return self._data.iget_values(i)
+        return self._mgr.iget_values(i)
 
     def _iter_column_arrays(self) -> Iterator[ArrayLike]:
         """
@@ -4862,7 +4862,7 @@ class DataFrame(NDFrame):
 
     @doc(NDFrame.isna, klass=_shared_doc_kwargs["klass"])
     def isna(self) -> "DataFrame":
-        result = self._constructor(self._data.isna(func=isna))
+        result = self._constructor(self._mgr.isna(func=isna))
         return result.__finalize__(self, method="isna")
 
     @doc(NDFrame.isna, klass=_shared_doc_kwargs["klass"])
@@ -8525,6 +8525,7 @@ NaN 12.3   33.0
         self,
         op,
         name: str,
+        *,
         axis=0,
         skipna=True,
         numeric_only=None,
@@ -8533,11 +8534,12 @@ NaN 12.3   33.0
     ):
 
         assert filter_type is None or filter_type == "bool", filter_type
+        out_dtype = "bool" if filter_type == "bool" else None
 
+        own_dtypes = [arr.dtype for arr in self._iter_column_arrays()]
         dtype_is_dt = np.array(
             [
-                is_datetime64_any_dtype(values.dtype)
-                for values in self._iter_column_arrays()
+                [is_datetime64_any_dtype(dtype) for dtype in own_dtypes],
             ],
             dtype=bool,
         )
@@ -8552,74 +8554,75 @@ NaN 12.3   33.0
             cols = self.columns[~dtype_is_dt]
             self = self[cols]
 
-        if axis is None and filter_type == "bool":
-            labels = None
-            constructor = None
-        else:
-            # TODO: Make other agg func handle axis=None properly
-            axis = self._get_axis_number(axis)
-            labels = self._get_agg_axis(axis)
-            constructor = self._constructor
+        # TODO: Make other agg func handle axis=None properly
+        axis = self._get_axis_number(axis)
+        labels = self._get_agg_axis(axis)
+        constructor = self._constructor
+        assert axis in [0, 1]
 
         def func(values):
             if is_extension_array_dtype(values.dtype):
                 return extract_array(values)._reduce(name, skipna=skipna, **kwds)
             else:
                 return op(values, axis=axis, skipna=skipna, **kwds)
+        
+        def blk_func(values):
+            if isinstance(values, ExtensionArray):
+                if values.ndim == 2:
+                    return values._reduce(name, skipna=skipna, axis=1, **kwds)
+                return values._reduce(name, skipna=skipna, **kwds)
+            else:
+                return op(values, axis=1, skipna=skipna, **kwds)
 
-        def _get_data(axis_matters):
+        def _get_data():
             if filter_type is None:
                 data = self._get_numeric_data()
-            elif filter_type == "bool":
-                if axis_matters:
-                    # GH#25101, GH#24434
-                    data = self._get_bool_data() if axis == 0 else self
-                else:
-                    data = self._get_bool_data()
-            else:  # pragma: no cover
-                msg = (
-                    f"Generating numeric_only data with filter_type {filter_type} "
-                    "not supported."
-                )
-                raise NotImplementedError(msg)
+            else:
+                # GH#25101, GH#24434
+                assert filter_type == "bool"
+                data = self._get_bool_data()
             return data
 
-        if numeric_only is not None and axis in [0, 1]:
+        if numeric_only is not None or axis == 0:
+            # For numeric_only non-None and axis non-None, we know
+            #  which blocks to use and no try/except is needed.
+            #  For numeric_only=None only the case with axis==0 and no object
+            #  dtypes are unambiguous can be handled with BlockManager.reduce
+            # Case with EAs see GH#35881
             df = self
             if numeric_only is True:
-                df = _get_data(axis_matters=True)
+                df = _get_data()
             if axis == 1:
                 df = df.T
                 axis = 0
 
-            out_dtype = "bool" if filter_type == "bool" else None
-
-            def blk_func(values):
-                if isinstance(values, ExtensionArray):
-                    return values._reduce(name, skipna=skipna, **kwds)
-                else:
-                    return op(values, axis=1, skipna=skipna, **kwds)
+            ignore_failures = numeric_only is None
 
             # After possibly _get_data and transposing, we are now in the
             #  simple case where we can use BlockManager._reduce
-            res = df._mgr.reduce(blk_func)
-            assert isinstance(res, dict)
-            if len(res):
-                assert len(res) == max(list(res.keys())) + 1, res.keys()
-            out = df._constructor_sliced(res, index=range(len(res)), dtype=out_dtype)
-            out.index = df.columns
+            res, indexer = df._mgr.reduce(blk_func, ignore_failures=ignore_failures)
+            out = df._constructor(res).iloc[0]
+            if out_dtype is not None:
+                out = out.astype(out_dtype)
             if axis == 0 and is_object_dtype(out.dtype):
-                out[:] = coerce_to_dtypes(out.values, df.dtypes)
+                # GH#35865 careful to cast explicitly to object
+                nvs = coerce_to_dtypes(out.values, df.dtypes.iloc[np.sort(indexer)])
+                out[:] = np.array(nvs, dtype=object)
+            if axis == 0 and len(self) == 0 and name in ["sum", "prod"]:
+                # Even if we are object dtype, follow numpy and return
+                #  float64, see test_apply_funcs_over_empty
+                out = out.astype(np.float64)
             return out
+
+        assert numeric_only is None
 
         if not self._is_homogeneous_type or self._mgr.any_extension_types:
             # try to avoid self.values call
 
-            if filter_type is None and axis == 0 and len(self) > 0:
+            if filter_type is None and axis == 0:
                 # operate column-wise
 
                 # numeric_only must be None here, as other cases caught above
-                # require len(self) > 0 bc frame_apply messes up empty prod/sum
 
                 # this can end up with a non-reduction
                 # but not always. if the types are mixed
@@ -8639,52 +8642,33 @@ NaN 12.3   33.0
                     result = result.iloc[0].rename(None)
                 return result
 
-        if numeric_only is None:
-            data = self
-            values = data.values
+        data = self
+        values = data.values
 
-            try:
-                result = func(values)
-
-            except TypeError:
-                # e.g. in nanops trying to convert strs to float
-
-                # TODO: why doesnt axis matter here?
-                data = _get_data(axis_matters=False)
-                labels = data._get_agg_axis(axis)
-
-                values = data.values
-                with np.errstate(all="ignore"):
-                    result = func(values)
-
-        else:
-            if numeric_only:
-                data = _get_data(axis_matters=True)
-                labels = data._get_agg_axis(axis)
-
-                values = data.values
-            else:
-                data = self
-                values = data.values
+        try:
             result = func(values)
 
-        if filter_type == "bool" and is_object_dtype(values) and axis is None:
-            # work around https://github.com/numpy/numpy/issues/10489
-            # TODO: can we de-duplicate parts of this with the next blocK?
-            result = np.bool_(result)
-        elif hasattr(result, "dtype") and is_object_dtype(result.dtype):
+        except TypeError:
+            # e.g. in nanops trying to convert strs to float
+
+            data = _get_data()
+            labels = data._get_agg_axis(axis)
+
+            values = data.values
+            with np.errstate(all="ignore"):
+                result = func(values)
+
+        if filter_type == "bool" and notna(result).all():
+            result = result.astype(np.bool_)
+        elif filter_type is None and is_object_dtype(result.dtype):
             try:
-                if filter_type is None:
-                    result = result.astype(np.float64)
-                elif filter_type == "bool" and notna(result).all():
-                    result = result.astype(np.bool_)
+                result = result.astype(np.float64)
             except (ValueError, TypeError):
                 # try to coerce to the original dtypes item by item if we can
                 if axis == 0:
                     result = coerce_to_dtypes(result, data.dtypes)
 
-        if constructor is not None:
-            result = self._constructor_sliced(result, index=labels)
+        result = self._constructor_sliced(result, index=labels)
         return result
 
     def nunique(self, axis=0, dropna=True) -> Series:

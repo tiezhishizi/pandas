@@ -3,6 +3,8 @@ import itertools
 import operator
 import re
 from typing import (
+    Any,
+    Callable,
     DefaultDict,
     Dict,
     List,
@@ -331,31 +333,42 @@ class BlockManager(PandasObject):
                 f"tot_items: {tot_items}"
             )
 
-    def reduce(self, func):
+    def reduce(
+        self: T, func: Callable, ignore_failures: bool = False
+    ) -> Tuple[T, np.ndarray]:
+        """
+        Apply reduction function blockwise, returning a single-row BlockManager.
+        Parameters
+        ----------
+        func : reduction function
+        ignore_failures : bool, default False
+            Whether to drop blocks where func raises TypeError.
+        Returns
+        -------
+        BlockManager
+        np.ndarray
+            Indexer of mgr_locs that are retained.
+        """
         # If 2D, we assume that we're operating column-wise
-        if self.ndim == 1:
-            # we'll be returning a scalar
-            blk = self.blocks[0]
-            return func(blk.values)
+        assert self.ndim == 2
 
-        res = {}
+        res_blocks: List[Block] = []
         for blk in self.blocks:
-            bres = func(blk.values)
+            nbs = blk.reduce(func, ignore_failures)
+            res_blocks.extend(nbs)
 
-            if np.ndim(bres) == 0:
-                # EA
-                assert blk.shape[0] == 1
-                new_res = zip(blk.mgr_locs.as_array, [bres])
+        index = Index([None])  # placeholder
+        if ignore_failures:
+            if res_blocks:
+                indexer = np.concatenate([blk.mgr_locs.as_array for blk in res_blocks])
+                new_mgr = self._combine(res_blocks, copy=False, index=index)
             else:
-                assert bres.ndim == 1, bres.shape
-                assert blk.shape[0] == len(bres), (blk.shape, bres.shape)
-                new_res = zip(blk.mgr_locs.as_array, bres)
-
-            nr = dict(new_res)
-            assert not any(key in res for key in nr)
-            res.update(nr)
-
-        return res
+                indexer = []
+                new_mgr = type(self).from_blocks([], [Index([]), index])
+        else:
+            indexer = np.arange(self.shape[0])
+            new_mgr = type(self).from_blocks(res_blocks, [self.items, index])
+        return new_mgr, indexer
 
     def operate_blockwise(self, other: "BlockManager", array_op) -> "BlockManager":
         """
@@ -722,8 +735,20 @@ class BlockManager(PandasObject):
         copy : bool, default False
             Whether to copy the blocks
         """
-        self._consolidate_inplace()
-        return self._combine([b for b in self.blocks if b.is_bool], copy)
+
+        new_blocks = []
+
+        for blk in self.blocks:
+            if blk.dtype == bool:
+                new_blocks.append(blk)
+
+            elif blk.is_object:
+                nbs = blk._split()
+                for nb in nbs:
+                    if nb.is_bool:
+                        new_blocks.append(nb)
+
+        return self._combine(new_blocks, copy)
 
     def get_numeric_data(self, copy: bool = False) -> "BlockManager":
         """
@@ -735,7 +760,9 @@ class BlockManager(PandasObject):
         self._consolidate_inplace()
         return self._combine([b for b in self.blocks if b.is_numeric], copy)
 
-    def _combine(self, blocks: List[Block], copy: bool = True) -> "BlockManager":
+    def _combine(
+        self: T, blocks: List[Block], copy: bool = True, index: Optional[Index] = None
+    ) -> T:
         """ return a new manager with the blocks """
         if len(blocks) == 0:
             return self.make_empty()
@@ -751,6 +778,8 @@ class BlockManager(PandasObject):
             new_blocks.append(b)
 
         axes = list(self.axes)
+        if index is not None:
+            axes[-1] = index
         axes[0] = self.items.take(indexer)
 
         return type(self).from_blocks(new_blocks, axes)

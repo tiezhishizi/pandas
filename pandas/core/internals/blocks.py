@@ -346,6 +346,32 @@ class Block(PandasObject):
 
         return self._split_op_result(result)
 
+    def reduce(self, func, ignore_failures: bool = False) -> List["Block"]:
+        # We will apply the function and reshape the result into a single-row
+        #  Block with the same mgr_locs; squeezing will be done at a higher level
+        assert self.ndim == 2
+
+        try:
+            if self.is_datetimetz:
+                # FIXME: kludge
+                result = func(self.values.reshape(self.shape))
+            else:
+                result = func(self.values)
+        except (TypeError, NotImplementedError):
+            if ignore_failures:
+                return []
+            raise
+        if np.ndim(result) == 0:
+            # TODO(EA2D): special case not needed with 2D EAs
+            res_values = np.array([[result]])
+        elif self.is_datetimetz:
+            res_values = result  # FIXME: kludge
+        else:
+            res_values = result.reshape(-1, 1)
+
+        nb = self.make_block(res_values)
+        return [nb]
+
     def _split_op_result(self, result) -> List["Block"]:
         # See also: split_and_operate
         if is_extension_array_dtype(result) and result.ndim > 1:
@@ -403,8 +429,24 @@ class Block(PandasObject):
             return block.fillna(value, limit=limit, inplace=inplace, downcast=None)
 
         return self.split_and_operate(None, f, inplace)
+    
+    def _split(self) -> List["Block"]:
+        """
+        Split a block into a list of single-column blocks.
+        """
+        assert self.ndim == 2
 
-    def split_and_operate(self, mask, f, inplace: bool) -> List["Block"]:
+        new_blocks = []
+        for i, ref_loc in enumerate(self.mgr_locs):
+            vals = self.values[slice(i, i + 1)]
+
+            nb = self.make_block(vals, [ref_loc])
+            new_blocks.append(nb)
+        return new_blocks
+
+    def split_and_operate(
+        self, mask, f, inplace: bool, ignore_failures: bool = False
+    ) -> List["Block"]:
         """
         split the block per-column, and apply the callable f
         per-column, return a new block for each. Handle
@@ -453,8 +495,16 @@ class Block(PandasObject):
             v = new_values[i]
 
             # need a new block
-            if m.any():
-                nv = f(m, v, i)
+            if m.any() or m.size == 0:
+                # Apply our function; we may ignore_failures if this is a
+                #  reduction that is dropping nuisance columns GH#37827
+                try:
+                    nv = f(m, v, i)
+                except TypeError:
+                    if ignore_failures:
+                        continue
+                    else:
+                        raise
             else:
                 nv = v if inplace else v.copy()
 
@@ -2376,6 +2426,36 @@ class ObjectBlock(Block):
         object
         """
         return lib.is_bool_array(self.values.ravel("K"))
+
+    def reduce(self, func, ignore_failures: bool = False) -> List[Block]:
+        """
+        For object-dtype, we operate column-wise.
+        """
+        assert self.ndim == 2
+
+        values = self.values
+        if len(values) > 1:
+            # split_and_operate expects func with signature (mask, values, inplace)
+            def mask_func(mask, values, inplace):
+                if values.ndim == 1:
+                    values = values.reshape(1, -1)
+                return func(values)
+
+            return self.split_and_operate(
+                None, mask_func, False, ignore_failures=ignore_failures
+            )
+
+        try:
+            res = func(values)
+        except TypeError:
+            if not ignore_failures:
+                raise
+            return []
+
+        assert isinstance(res, np.ndarray)
+        assert res.ndim == 1
+        res = res.reshape(1, -1)
+        return [self.make_block_same_class(res)]
 
     def convert(
         self,
